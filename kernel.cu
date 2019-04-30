@@ -9,7 +9,12 @@
 #include "helper_math.h"
 #include "noise.h"
 
-#define ITERATIONS 2
+#define ITERATIONS 1000
+
+#define PRESSURE 1.2
+#define SOUND_VELOCITY 340
+#define TIME_STEP 7.81e-6
+#define STEP_SIZE 3.83e-4
 
 void ppm(float* data, int width, int height, const std::string& path);
 void writeOutput(float4* data, int width, int height, const std::string& path);
@@ -22,33 +27,145 @@ surface<void, 2> outputSurfRef;
 // --- 2D float4 texture
 texture<float4, cudaTextureType2D, cudaReadModeElementType> texRef;
 
-__device__ float2 getSamplerLocation(float2 location, int2 dimension)
+/*
+ * Function for transforming to normalized sampler locations.
+ */
+__device__ __inline__ float2 sl(float x, float y, int width, int height)
 {
-	return make_float2(((float)location.x + 0.5f) / (float)dimension.x, ((float)location.y + 0.5f) / (float)dimension.y);
+	return make_float2((x + 0.5f) / (float)width, (y + 0.5f) / (float)height);
 }
 
+
+float __device__ divergence(float x, float y, int width, int height)
+{
+	float2 origSampler = sl(x, y, width, height);
+	float2 xSampler = sl(x + 1.0, y, width, height);
+	float2 ySampler = sl(x, y + 1.0, width, height);
+	
+	float4 valuesOrig = tex2D(texRef, origSampler.x, origSampler.y);
+	float4 valuesX = tex2D(texRef, xSampler.x, xSampler.y);
+	float4 valuesY = tex2D(texRef, ySampler.x, ySampler.y);
+	
+	float vx = valuesX.y - valuesOrig.y;
+	float vy = valuesY.z - valuesOrig.z;
+	
+	return vx + vy;
+}
+
+float2 __device__ gradient(float x, float y, int width, int height)
+{
+	float2 origSampler = sl(x, y, width, height);
+	float2 xSampler = sl(x - 1.0, y, width, height);
+	float2 ySampler = sl(x, y - 1.0, width, height);
+
+	float4 valuesOrig = tex2D(texRef, origSampler.x, origSampler.y);
+	float4 valuesX = tex2D(texRef, xSampler.x, xSampler.y);
+	float4 valuesY = tex2D(texRef, ySampler.x, ySampler.y);
+
+	float vx = valuesOrig.x - valuesX.x;
+	float vy = valuesOrig.x - valuesY.x;
+	
+	return make_float2(vx, vy);
+}
+
+
+
 // Simple copy kernel
-__global__ void iterate(int width, int height)
+__global__ void iteratePressure(int width, int height)
 {
 	// Calculate surface coordinates
 	unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
 	unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
 	if (x < width && y < height)
 	{
-		float2 samplerLocation = getSamplerLocation(make_float2(x, y), make_int2(width, height));
-		float2 samplerLocation1 = getSamplerLocation(make_float2(x - 1, y - 1), make_int2(width, height));
-		float2 samplerLocation2 = getSamplerLocation(make_float2(x - 1, y + 1), make_int2(width, height));
-		float2 samplerLocation3 = getSamplerLocation(make_float2(x + 1, y + 1), make_int2(width, height));
-		float2 samplerLocation4 = getSamplerLocation(make_float2(x + 1, y - 1), make_int2(width, height));
+		float2 sampler = sl(x, y, width, height);
 
-		float4 value = 5 * tex2D(texRef, samplerLocation.x, samplerLocation.y);
-		value -= tex2D(texRef, samplerLocation1.x, samplerLocation1.y);
-		value -= tex2D(texRef, samplerLocation2.x, samplerLocation2.y);
-		value -= tex2D(texRef, samplerLocation3.x, samplerLocation3.y);
-		value -= tex2D(texRef, samplerLocation4.x, samplerLocation4.y);
+		float4 values = tex2D(texRef, sampler.x, sampler.y);
+
+		float div = divergence(x, y, width, height);
+		float pressure = TIME_STEP * PRESSURE * SOUND_VELOCITY * SOUND_VELOCITY * div / STEP_SIZE;
+
+			// pressure valid
+		values.x -= pressure;
+
+		surf2Dwrite<float4>(values, outputSurfRef, x * sizeof(float4), y);
+
+	}
+}
+
+__global__ void iterateVelocity(int width, int height)
+{
+
+	// Calculate surface coordinates
+	unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
+	unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
+	if (x < width && y < height)
+	{
+
+		float2 sampler = sl(x, y, width, height);
+		float4 values = tex2D(texRef, sampler.x, sampler.y);
+		float2 grad = gradient(x, y, width, height);
 		
-		// Write to output surface
-		surf2Dwrite<float4>(value, outputSurfRef, x * sizeof(float4), y);
+		float2 velocity = TIME_STEP * grad / (PRESSURE);
+
+		if (y > 0)
+		{
+			// x valid
+			values.y -= velocity.x;
+		}
+
+		if (x > 0)
+		{
+			// y valid
+			values.z -= velocity.y;
+		}
+		surf2Dwrite<float4>(values, outputSurfRef, x * sizeof(float4), y);
+
+	}
+}
+
+// Simple copy kernel
+__global__ void firstVelocityIteration(int width, int height)
+{
+	// Calculate surface coordinates
+	unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
+	unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
+	if (x < width && y < height)
+	{
+		float2 sampler = sl(x, y, width, height);
+		float4 values = tex2D(texRef, sampler.x, sampler.y);
+		float2 grad = gradient(x, y, width, height);
+
+		float2 velocity = 0.5 * TIME_STEP * grad / (PRESSURE);
+
+		if (y > 0)
+		{
+			// x valid
+			values.y -= velocity.x;
+		}
+
+		if (x > 0)
+		{
+			// y valid
+			values.z -= velocity.y;
+		}
+		surf2Dwrite<float4>(values, outputSurfRef, x * sizeof(float4), y);
+
+	}
+}
+
+void __global__ transformTest(int width, int height)
+{
+	unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
+	unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
+	if (x < width && y < height)
+	{
+		float2 sampler1 = sl(x + 1, y + 1, width, height);
+		float2 sampler2 = sl(x + 1, y - 1, width, height);
+		float2 sampler3 = sl(x - 1, y - 1, width, height);
+		float2 sampler4 = sl(x - 1, y + 1, width, height);
+		float4 values = tex2D(texRef, sampler1.x, sampler1.y) + tex2D(texRef, sampler2.x, sampler2.y) + tex2D(texRef, sampler3.x, sampler3.y) + tex2D(texRef, sampler4.x, sampler4.y);
+		surf2Dwrite<float4>(values / 4, outputSurfRef, x * sizeof(float4), y);
 	}
 }
 
@@ -76,21 +193,21 @@ void CUDA(cudaError_t e) {
 int main()
 {
 
-	const size_t width = 512, height = 512;
+	const size_t width = 256, height = 128;
 	float4* h_data = new float4[width * height];
 	size_t size = width * height * sizeof(float4);
-
-
+	/*
 	float4 min = make_float4(std::numeric_limits<float>::max());
 	float4 max = make_float4(std::numeric_limits<float>::min());
+	
 	for(int i = 0; i < height; i++)
 	for(int j = 0; j < width; j++)
 	{
 		float4 value = make_float4(
-			perlin2d((float)j / width + 0000, (float)i / height + 000, 4.0, 12),
 			perlin2d((float)j / width + 8734, (float)i / height + 834, 4.0, 12),
-			perlin2d((float)j / width + 1637, (float)i / height + 137, 4.0, 12),
-			0.0f
+			0,
+			0,
+			0
 		);
 		h_data[i * width + j] = value;
 		min = fminf(min, value);
@@ -99,8 +216,13 @@ int main()
 	for (int i = 0; i < height; i++)
 	for (int j = 0; j < width; j++)
 	{
-		h_data[i * width + j] = 0.5 * (h_data[i * width + j] - min) / (max - min) + 0.25;
-	}
+		h_data[i * width + j].x = ((h_data[i * width + j] - min) / (max - min) - 0.5).x;
+	}*/
+	std::fill_n(h_data, width * height, make_float4(0.0f));
+	h_data[width*(height / 2) + width / 4 + 1].x = 5;
+	h_data[width*(height / 2 + 1) + width / 4 + 1].x =5;
+	h_data[width*(height / 2 + 1) + width / 4].x = 5;
+	h_data[width*(height / 2) + width / 4].x = 5;
 	
 	// Allocate CUDA arrays in device memory
 	cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<float4>();
@@ -119,22 +241,31 @@ int main()
 	CUDA(cudaBindSurfaceToArray(inputSurfRef, cuInputArray));
 	CUDA(cudaBindSurfaceToArray(outputSurfRef, cuOutputArray));
 
-
 	texRef.normalized = true;
 	texRef.filterMode = cudaFilterModeLinear;
-	texRef.addressMode[0] = cudaAddressModeMirror; // extend at border
-	texRef.addressMode[1] = cudaAddressModeMirror;
-	texRef.addressMode[2] = cudaAddressModeMirror;
+	texRef.addressMode[0] = cudaAddressModeClamp; // extend at border
+	texRef.addressMode[1] = cudaAddressModeClamp;
+	texRef.addressMode[2] = cudaAddressModeClamp;
 
 	CUDA(cudaBindTextureToArray(&texRef, cuInputArray, &channelDesc));
 
 	// Invoke kernel
-	dim3 dimBlock(32, 16);
+	dim3 dimBlock(32, 32);
 	dim3 dimGrid((width + dimBlock.x - 1) / dimBlock.x, (height + dimBlock.y - 1) / dimBlock.y);
+
+	firstVelocityIteration << <dimGrid, dimBlock >> > (width, height);
+	CUDA(cudaDeviceSynchronize());
+	writeBack << <dimGrid, dimBlock >> > (width, height);
+	CUDA(cudaDeviceSynchronize());
 
 	for (int i = 0; i < ITERATIONS; i++)
 	{
-		iterate << <dimGrid, dimBlock >> > (width, height);
+		iteratePressure<< <dimGrid, dimBlock >> > (width, height);
+		CUDA(cudaDeviceSynchronize());
+		writeBack << <dimGrid, dimBlock >> > (width, height);
+		CUDA(cudaDeviceSynchronize());
+
+		iterateVelocity<< <dimGrid, dimBlock >> > (width, height);
 		CUDA(cudaDeviceSynchronize());
 		writeBack << <dimGrid, dimBlock >> > (width, height);
 		CUDA(cudaDeviceSynchronize());
@@ -162,9 +293,10 @@ void writeOutput(float4* data, int width, int height, const std::string& path)
 
 	for (int i = 0; i < width * height; i++)
 	{
-		output[3 * i + 0] = data[i].x;
-		output[3 * i + 1] = data[i].y;
-		output[3 * i + 2] = data[i].z;
+		float value = clamp(data[i].x * 0.5f + 0.5f, 0.0f, 1.0f);
+		output[3 * i + 0] = value;
+		output[3 * i + 1] = value;
+		output[3 * i + 2] = value; //sqrt(1 - value1 * value1 - value2 * value2);
 	}
 
 	ppm(output, width, height, "output.ppm");
@@ -184,9 +316,9 @@ void ppm(float* data, int width, int height, const std::string& path)
 		for (i = 0; i < width; ++i)
 		{
 			static unsigned char color[3];
-			color[0] = (unsigned char) (data[3 * (j * width + i) + 0] * 256);
-			color[1] = (unsigned char) (data[3 * (j * width + i) + 1] * 256);
-			color[2] = (unsigned char) (data[3 * (j * width + i) + 2] * 256);
+			color[0] = (unsigned char) (data[3 * (j * width + i) + 0] * 255);
+			color[1] = (unsigned char) (data[3 * (j * width + i) + 1] * 255);
+			color[2] = (unsigned char) (data[3 * (j * width + i) + 2] * 255);
 			(void)fwrite(color, 1, 3, fp);
 		}
 	}
