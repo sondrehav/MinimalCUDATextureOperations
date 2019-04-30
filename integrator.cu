@@ -7,19 +7,20 @@
 #include <string>
 
 #include "helper_math.h"
-#include "noise.h"
 #include <chrono>
 #include <thread>
 
-#define ITERATIONS 100000
+void ppm(float* data, int width, int height, const std::string& path);
+void writeOutput(float* data, int width, int height, const std::string& path);
+void generatePMLData(int width, int height, int pmlLayers, double pmlMax, float4* data);
+
+#define ITERATIONS 1000
 
 #define PRESSURE 1.2
 #define SOUND_VELOCITY 340
 #define TIME_STEP 7.81e-6
 #define STEP_SIZE 3.83e-4
 
-void ppm(float* data, int width, int height, const std::string& path);
-void writeOutput(float* data, int width, int height, const std::string& path);
 
 // Surfaces for writing
 surface<void, 2> velocitySurface;
@@ -28,6 +29,7 @@ surface<void, 2> pressureSurface;
 // Textures for reading
 texture<float2, cudaTextureType2D, cudaReadModeElementType> velocityTexRef;
 texture<float, cudaTextureType2D, cudaReadModeElementType> pressureTexRef;
+texture<float4, cudaTextureType2D, cudaReadModeElementType> pmlTexRef;
 
 /*
  * Function for transforming to normalized sampler locations.
@@ -88,9 +90,10 @@ __global__ void iteratePressure(int width, int height, double timeStep)
 		float2 sampler = sl(x, y, width, height);
 
 		float values = tex2D(pressureTexRef, sampler.x, sampler.y);
+		float pmlValue = tex2D(pmlTexRef, sampler.x, sampler.y).z;
 
 		float div = divergence(x, y, width, height);
-		float pressure = timeStep * PRESSURE * SOUND_VELOCITY * SOUND_VELOCITY * div / STEP_SIZE;
+		float pressure = timeStep * (PRESSURE * SOUND_VELOCITY * SOUND_VELOCITY * div / STEP_SIZE + pmlValue * values);
 
 		values -= pressure;
 
@@ -113,8 +116,11 @@ __global__ void iterateVelocity(int width, int height, double timeStep)
 		float2 sampler = sl(x, y, width, height);
 		float2 values = tex2D(velocityTexRef, sampler.x, sampler.y);
 		float2 grad = gradient(x, y, width, height);
+
+		float4 pml = tex2D(pmlTexRef, sampler.x, sampler.y);
+		float2 pmlVelocity = make_float2(pml.x, pml.y);
 		
-		float2 velocity = timeStep * grad / (PRESSURE);
+		float2 velocity = timeStep * (grad / PRESSURE + pmlVelocity * values);
 
 		if (y > 0)
 		{
@@ -132,6 +138,8 @@ __global__ void iterateVelocity(int width, int height, double timeStep)
 	}
 }
 
+
+
 /*
  * Checks errors and aborts if something is wrong.
  */
@@ -147,38 +155,58 @@ void CUDA(cudaError_t e) {
 int main()
 {
 
-	const size_t width = 64, height = 64;
-	float* h_pressureData = new float[width * height];
-	float2* h_velocityData = new float2[width * height];
+	// Simulation parameters
+	const size_t pmlLayers = 64;
+	const float pmlMax = 1e-1 * 0.5 / TIME_STEP;
+	const size_t width = 256, height = 128;
 
-	size_t pressureArraySize = width * height * sizeof(float);
-	size_t velocityArraySize = width * height * sizeof(float2);
-	
-	std::fill_n(h_pressureData, width * height, 0.0f);
-	h_pressureData[width*(height / 2) + width / 4 + 1] = 5;
-	h_pressureData[width*(height / 2 + 1) + width / 4 + 1] = 5;
-	h_pressureData[width*(height / 2 + 1) + width / 4] = 5;
-	h_pressureData[width*(height / 2) + width / 4] = 5;
+	// Calculate the actual simulation size (size + pmlLayers)
+	const size_t actualWidth = width + 2 * pmlLayers, actualHeight= height + 2 * pmlLayers;
 
-	std::fill_n(h_velocityData, width * height, make_float2(0.0f));
+	// Buffer sizes
+	size_t pressureArraySize = actualWidth * actualHeight * sizeof(float);
+	size_t velocityArraySize = actualWidth * actualHeight * sizeof(float2);
+	size_t pmlArraySize = actualWidth * actualHeight * sizeof(float4);
+
+	// Allocate the host buffers
+	float* h_pressureData = new float[actualWidth * actualHeight];
+	float2* h_velocityData = new float2[actualWidth * actualHeight];
+	float4* h_pmlData = new float4[actualWidth * actualHeight];
+
+	// Put the stuff in the stuff
+	generatePMLData(width, height, pmlLayers, pmlMax, h_pmlData);
+
+	std::fill_n(h_pressureData, actualWidth * actualHeight, 0.0f);
+	h_pressureData[actualWidth*(actualHeight / 2) + actualWidth / 4 + 1] = 5;
+	h_pressureData[actualWidth*(actualHeight / 2 + 1) + actualWidth / 4 + 1] = 5;
+	h_pressureData[actualWidth*(actualHeight / 2 + 1) + actualWidth / 4] = 5;
+	h_pressureData[actualWidth*(actualHeight / 2) + actualWidth / 4] = 5;
+
+	std::fill_n(h_velocityData, actualWidth * actualHeight, make_float2(0.0f));
 	
 	// Allocate CUDA arrays in device memory
 	cudaChannelFormatDesc velocityChannelDesc = cudaCreateChannelDesc<float2>();
 	cudaChannelFormatDesc pressureChannelDesc = cudaCreateChannelDesc<float>();
+	cudaChannelFormatDesc pmlChannelDesc = cudaCreateChannelDesc<float4>();
 
+	// Allocate arrays on the device
 	cudaArray* cuPressureArray;
-	CUDA(cudaMallocArray(&cuPressureArray, &pressureChannelDesc, width, height, cudaArraySurfaceLoadStore));
+	CUDA(cudaMallocArray(&cuPressureArray, &pressureChannelDesc, actualWidth, actualHeight, cudaArraySurfaceLoadStore));
 
 	cudaArray* cuVelocityArray;
-	CUDA(cudaMallocArray(&cuVelocityArray, &velocityChannelDesc, width, height, cudaArraySurfaceLoadStore));
+	CUDA(cudaMallocArray(&cuVelocityArray, &velocityChannelDesc, actualWidth, actualHeight, cudaArraySurfaceLoadStore));
 
-	// Copy to device memory some data located at address h_data
-	// in host memory 
+	cudaArray* cuPMLArray;
+	CUDA(cudaMallocArray(&cuPMLArray, &pmlChannelDesc, actualWidth, actualHeight, cudaArraySurfaceLoadStore));
+
+	// Copy to device memory some data located at address h_pressureData in host memory 
 	CUDA(cudaMemcpyToArray(cuPressureArray, 0, 0, h_pressureData, pressureArraySize, cudaMemcpyHostToDevice));
 
-
+	// Copy to device memory some data located at address h_velocityData in host memory 
 	CUDA(cudaMemcpyToArray(cuVelocityArray, 0, 0, h_velocityData, velocityArraySize, cudaMemcpyHostToDevice));
 	
+	// Copy to device memory some data located at address h_pmlData in host memory 
+	CUDA(cudaMemcpyToArray(cuPMLArray, 0, 0, h_pmlData, pmlArraySize, cudaMemcpyHostToDevice));
 
 	// Bind the arrays to the surface references
 	CUDA(cudaBindSurfaceToArray(velocitySurface, cuVelocityArray));
@@ -193,23 +221,29 @@ int main()
 	pressureTexRef.filterMode = cudaFilterModeLinear;
 	pressureTexRef.addressMode[0] = cudaAddressModeClamp; // extend at border
 
+	pmlTexRef.normalized = true;
+	pmlTexRef.filterMode = cudaFilterModeLinear;
+	pmlTexRef.addressMode[0] = cudaAddressModeBorder; // extend at border
+	pmlTexRef.addressMode[1] = cudaAddressModeBorder; // extend at border
+	pmlTexRef.addressMode[2] = cudaAddressModeBorder; // extend at border
+
 	CUDA(cudaBindTextureToArray(&pressureTexRef, cuPressureArray, &pressureChannelDesc));
 	CUDA(cudaBindTextureToArray(&velocityTexRef, cuVelocityArray, &velocityChannelDesc));
+	CUDA(cudaBindTextureToArray(&pmlTexRef, cuPMLArray, &pmlChannelDesc));
 
 	// Invoke kernel
 	dim3 dimBlock(32, 32);
-	dim3 dimGrid((width + dimBlock.x - 1) / dimBlock.x, (height + dimBlock.y - 1) / dimBlock.y);
+	dim3 dimGrid((actualWidth + dimBlock.x - 1) / dimBlock.x, (actualHeight + dimBlock.y - 1) / dimBlock.y);
 
-	/* FINALLY after all that boiler plate the actual simulation can begin. */
-
+	/* FINALLY after all that crap the actual simulation can begin. */
 	
 	std::chrono::time_point<std::chrono::steady_clock> start = std::chrono::steady_clock::now();
 
-	iterateVelocity << <dimGrid, dimBlock >> > (width, height, TIME_STEP * 0.5);
+	iterateVelocity << <dimGrid, dimBlock >> > (actualWidth, actualHeight, TIME_STEP * 0.5);
 	for (int i = 0; i < ITERATIONS; i++)
 	{
-		iteratePressure<< <dimGrid, dimBlock >> > (width, height, TIME_STEP);
-		iterateVelocity<< <dimGrid, dimBlock >> > (width, height, TIME_STEP);
+		iteratePressure<< <dimGrid, dimBlock >> > (actualWidth, actualHeight, TIME_STEP);
+		iterateVelocity<< <dimGrid, dimBlock >> > (actualWidth, actualHeight, TIME_STEP);
 		if(i % (ITERATIONS / 100) == 0)
 		{
 			printf("Iteration %d of %d...\n", i, ITERATIONS);
@@ -229,15 +263,36 @@ int main()
 	// Free device memory
 	CUDA(cudaFreeArray(cuPressureArray));
 	CUDA(cudaFreeArray(cuVelocityArray));
+	CUDA(cudaFreeArray(cuPMLArray));
 
-	writeOutput(h_pressureData, width, height, "output.ppm");
+	writeOutput(h_pressureData, actualWidth, actualHeight, "output.pml");
 	
 	delete[] h_pressureData;
+	delete[] h_pmlData;
 	delete[] h_velocityData;
-
 
 	system("pause");
 	return 0;
+}
+
+void generatePMLData(int width, int height, int pmlLayers, double pmlMax, float4* data)
+{
+	const size_t actualWidth = width + 2 * pmlLayers, actualHeight = height + 2 * pmlLayers;
+	std::fill_n(data, actualWidth * actualHeight, make_float4(0.0f));
+	for(int i = 0; i < actualHeight; i++)
+	for(int j = 0; j < actualWidth; j++)
+	{
+		float pressurePMLXDirection = fmaxf((float)(pmlLayers - j) / pmlLayers, 0.0f) + fmaxf((float)j / pmlLayers - (actualWidth - 2.0f - pmlLayers) / pmlLayers, 0.0f);
+		float pressurePMLYDirection = fmaxf((float)(pmlLayers - i) / pmlLayers, 0.0f) + fmaxf((float)i / pmlLayers - (actualHeight - 2.0f - pmlLayers) / pmlLayers, 0.0f);
+		
+		float velocityPMLXDirection = fmaxf((float)(pmlLayers - j) / pmlLayers, 0.0f) + fmaxf((float)j / pmlLayers - (actualWidth - 1.0f - pmlLayers) / pmlLayers, 0.0f);
+		float velocityPMLYDirection = fmaxf((float)(pmlLayers - i) / pmlLayers, 0.0f) + fmaxf((float)i / pmlLayers - (actualHeight - pmlLayers) / pmlLayers, 0.0f);
+
+		data[i*actualWidth + j].x = pmlMax * velocityPMLXDirection;
+		data[i*actualWidth + j].y = pmlMax * velocityPMLYDirection;
+		data[i*actualWidth + j].z = pmlMax * (pressurePMLXDirection + pressurePMLYDirection);
+
+	}
 }
 
 void writeOutput(float* data, int width, int height, const std::string& path)
@@ -246,7 +301,7 @@ void writeOutput(float* data, int width, int height, const std::string& path)
 
 	for (int i = 0; i < width * height; i++)
 	{
-		float value = clamp(data[i] * 0.5f + 0.5f, 0.0f, 1.0f);
+		float value = clamp(data[i] * 0.5 + 0.5, 0.0f, 1.0f);
 		output[3 * i + 0] = value;
 		output[3 * i + 1] = value;
 		output[3 * i + 2] = value;
@@ -256,7 +311,6 @@ void writeOutput(float* data, int width, int height, const std::string& path)
 
 	delete[] output;
 }
-
 
 void ppm(float* data, int width, int height, const std::string& path)
 {

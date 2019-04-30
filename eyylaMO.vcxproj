@@ -80,14 +80,11 @@
     </CudaCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <CudaCompile Include="kernel.cu" />
+    <CudaCompile Include="integrator.cu" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="helper_math.h" />
-    <ClInclude Include="noise.h" />
-  </ItemGroup>
-  <ItemGroup>
-    <ClCompile Include="noise.cpp" />
+    <ClInclude Include="integrator.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
