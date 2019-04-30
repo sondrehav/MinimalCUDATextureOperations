@@ -8,8 +8,10 @@
 
 #include "helper_math.h"
 #include "noise.h"
+#include <chrono>
+#include <thread>
 
-#define ITERATIONS 1000
+#define ITERATIONS 100000
 
 #define PRESSURE 1.2
 #define SOUND_VELOCITY 340
@@ -19,12 +21,11 @@
 void ppm(float* data, int width, int height, const std::string& path);
 void writeOutput(float* data, int width, int height, const std::string& path);
 
-// static __device__ __forceinline__ void surf2Dwrite(T val, surface<void, cudaSurfaceType2D> surf, int x, int y, int s, enum cudaSurfaceBoundaryMode mode = cudaBoundaryModeTrap)
-// 2D surfaces
+// Surfaces for writing
 surface<void, 2> velocitySurface;
 surface<void, 2> pressureSurface;
 
-// --- 2D float4 texture
+// Textures for reading
 texture<float2, cudaTextureType2D, cudaReadModeElementType> velocityTexRef;
 texture<float, cudaTextureType2D, cudaReadModeElementType> pressureTexRef;
 
@@ -36,7 +37,10 @@ __device__ __inline__ float2 sl(float x, float y, int width, int height)
 	return make_float2((x + 0.5f) / (float)width, (y + 0.5f) / (float)height);
 }
 
-
+/*
+ * Calculates the divergence of the velocity field. Note that the grid is staggered 
+ * and everything that entails...
+ */
 float __device__ divergence(float x, float y, int width, int height)
 {
 	float2 origSampler = sl(x, y, width, height);
@@ -53,6 +57,9 @@ float __device__ divergence(float x, float y, int width, int height)
 	return vx + vy;
 }
 
+/*
+ * Calculates the gradient at the specified location.
+ */
 float2 __device__ gradient(float x, float y, int width, int height)
 {
 	float2 origSampler = sl(x, y, width, height);
@@ -69,12 +76,11 @@ float2 __device__ gradient(float x, float y, int width, int height)
 	return make_float2(vx, vy);
 }
 
-
-
-// Simple copy kernel
-__global__ void iteratePressure(int width, int height)
+/*
+ * Does one iteration of the pressure calculation.
+ */
+__global__ void iteratePressure(int width, int height, double timeStep)
 {
-	// Calculate surface coordinates
 	unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
 	unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
 	if (x < width && y < height)
@@ -84,9 +90,8 @@ __global__ void iteratePressure(int width, int height)
 		float values = tex2D(pressureTexRef, sampler.x, sampler.y);
 
 		float div = divergence(x, y, width, height);
-		float pressure = TIME_STEP * PRESSURE * SOUND_VELOCITY * SOUND_VELOCITY * div / STEP_SIZE;
+		float pressure = timeStep * PRESSURE * SOUND_VELOCITY * SOUND_VELOCITY * div / STEP_SIZE;
 
-			// pressure valid
 		values -= pressure;
 
 		surf2Dwrite<float>(values, pressureSurface, x * sizeof(float), y);
@@ -94,20 +99,22 @@ __global__ void iteratePressure(int width, int height)
 	}
 }
 
-__global__ void iterateVelocity(int width, int height)
+/*
+ * Does one iteration of the velocity calculations. Note that the velocity
+ * grid is only defined for width * (height - 1) for the x direction and
+ * (width - 1) * height for the y direction due to the staggered grid layout.
+ */
+__global__ void iterateVelocity(int width, int height, double timeStep)
 {
-
-	// Calculate surface coordinates
 	unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
 	unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
 	if (x < width && y < height)
 	{
-
 		float2 sampler = sl(x, y, width, height);
 		float2 values = tex2D(velocityTexRef, sampler.x, sampler.y);
 		float2 grad = gradient(x, y, width, height);
 		
-		float2 velocity = TIME_STEP * grad / (PRESSURE);
+		float2 velocity = timeStep * grad / (PRESSURE);
 
 		if (y > 0)
 		{
@@ -125,37 +132,9 @@ __global__ void iterateVelocity(int width, int height)
 	}
 }
 
-// Simple copy kernel
-__global__ void firstVelocityIteration(int width, int height)
-{
-	// Calculate surface coordinates
-	unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
-	unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
-	if (x < width && y < height)
-	{
-
-		float2 sampler = sl(x, y, width, height);
-		float2 values = tex2D(velocityTexRef, sampler.x, sampler.y);
-		float2 grad = gradient(x, y, width, height);
-
-		float2 velocity = 0.5 * TIME_STEP * grad / (PRESSURE);
-
-		if (y > 0)
-		{
-			// x valid
-			values.x -= velocity.x;
-		}
-
-		if (x > 0)
-		{
-			// y valid
-			values.y -= velocity.y;
-		}
-		surf2Dwrite<float2>(values, velocitySurface, x * sizeof(float2), y);
-
-	}
-}
-
+/*
+ * Checks errors and aborts if something is wrong.
+ */
 void CUDA(cudaError_t e) { 
 	if (e != cudaSuccess)
 	{
@@ -168,34 +147,13 @@ void CUDA(cudaError_t e) {
 int main()
 {
 
-	const size_t width = 256, height = 128;
+	const size_t width = 64, height = 64;
 	float* h_pressureData = new float[width * height];
 	float2* h_velocityData = new float2[width * height];
 
 	size_t pressureArraySize = width * height * sizeof(float);
 	size_t velocityArraySize = width * height * sizeof(float2);
-	/*
-	float4 min = make_float4(std::numeric_limits<float>::max());
-	float4 max = make_float4(std::numeric_limits<float>::min());
 	
-	for(int i = 0; i < height; i++)
-	for(int j = 0; j < width; j++)
-	{
-		float4 value = make_float4(
-			perlin2d((float)j / width + 8734, (float)i / height + 834, 4.0, 12),
-			0,
-			0,
-			0
-		);
-		h_data[i * width + j] = value;
-		min = fminf(min, value);
-		max = fmaxf(max, value);
-	}
-	for (int i = 0; i < height; i++)
-	for (int j = 0; j < width; j++)
-	{
-		h_data[i * width + j].x = ((h_data[i * width + j] - min) / (max - min) - 0.5).x;
-	}*/
 	std::fill_n(h_pressureData, width * height, 0.0f);
 	h_pressureData[width*(height / 2) + width / 4 + 1] = 5;
 	h_pressureData[width*(height / 2 + 1) + width / 4 + 1] = 5;
@@ -220,7 +178,6 @@ int main()
 
 
 	CUDA(cudaMemcpyToArray(cuVelocityArray, 0, 0, h_velocityData, velocityArraySize, cudaMemcpyHostToDevice));
-
 	
 
 	// Bind the arrays to the surface references
@@ -231,13 +188,10 @@ int main()
 	velocityTexRef.filterMode = cudaFilterModeLinear;
 	velocityTexRef.addressMode[0] = cudaAddressModeClamp; // extend at border
 	velocityTexRef.addressMode[1] = cudaAddressModeClamp;
-	velocityTexRef.addressMode[2] = cudaAddressModeClamp;
 
 	pressureTexRef.normalized = true;
 	pressureTexRef.filterMode = cudaFilterModeLinear;
 	pressureTexRef.addressMode[0] = cudaAddressModeClamp; // extend at border
-	pressureTexRef.addressMode[1] = cudaAddressModeClamp;
-	pressureTexRef.addressMode[2] = cudaAddressModeClamp;
 
 	CUDA(cudaBindTextureToArray(&pressureTexRef, cuPressureArray, &pressureChannelDesc));
 	CUDA(cudaBindTextureToArray(&velocityTexRef, cuVelocityArray, &velocityChannelDesc));
@@ -246,18 +200,26 @@ int main()
 	dim3 dimBlock(32, 32);
 	dim3 dimGrid((width + dimBlock.x - 1) / dimBlock.x, (height + dimBlock.y - 1) / dimBlock.y);
 
-	firstVelocityIteration << <dimGrid, dimBlock >> > (width, height);
-	CUDA(cudaDeviceSynchronize());
+	/* FINALLY after all that boiler plate the actual simulation can begin. */
 
+	
+	std::chrono::time_point<std::chrono::steady_clock> start = std::chrono::steady_clock::now();
+
+	iterateVelocity << <dimGrid, dimBlock >> > (width, height, TIME_STEP * 0.5);
 	for (int i = 0; i < ITERATIONS; i++)
 	{
-		iteratePressure<< <dimGrid, dimBlock >> > (width, height);
-		CUDA(cudaDeviceSynchronize());
-
-		iterateVelocity<< <dimGrid, dimBlock >> > (width, height);
-		CUDA(cudaDeviceSynchronize());
+		iteratePressure<< <dimGrid, dimBlock >> > (width, height, TIME_STEP);
+		iterateVelocity<< <dimGrid, dimBlock >> > (width, height, TIME_STEP);
+		if(i % (ITERATIONS / 100) == 0)
+		{
+			printf("Iteration %d of %d...\n", i, ITERATIONS);
+		}
 	}
 	
+	std::chrono::time_point<std::chrono::steady_clock> end = std::chrono::steady_clock::now();
+	std::chrono::nanoseconds diff = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
+
+	printf("Simulation took %f milliseconds.\n", diff.count() / 1e6);
 
 	CUDA(cudaPeekAtLastError());
 
@@ -273,6 +235,8 @@ int main()
 	delete[] h_pressureData;
 	delete[] h_velocityData;
 
+
+	system("pause");
 	return 0;
 }
 
